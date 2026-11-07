@@ -1,0 +1,1772 @@
+//import * as parse5 from "parse5";
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import JSZip from "jszip";
+import parse5 from "parse5";
+import Decimal from "decimal.js";
+import { StatusCodes } from "http-status-codes";
+
+import coursesRouter from "./routers/coursesRouter";
+import sectionsRouter from "./routers/sectionsRouter";
+import { DataDirectory } from "./repositories/dataDirectory";
+import { Course } from "./services/course";
+import { Section } from "./services/section";
+import { Queryable } from "./services/queryable";
+import { IGeoLocator } from "./geolocation/IGeoLocator";
+import { GeoLocator } from "./geolocation/GeoLocator";
+
+import { Room } from "./services/room";
+import { Building } from "./services/building";
+import { validateBuildingParams, validateRoomParams } from "./validation/buildingsValidation";
+import { BuildingService } from "./services/buildingService";
+import { FsBuildingRepository } from "./repositories/buildingRepository";
+import { createBuildingsRouter } from "./routers/buildingsRouter";
+const datasets: Dataset[] = [];
+const RESULT_LIMIT = 5000;
+const OVERALL_SECTION_YEAR = 1900;
+
+// Dataset processing happens asynchronously (see postDataset/postUpdatedDataset), but jobs are chained onto this
+// queue so that at most one runs at a time. Requests still receive their 202 response immediately either way;
+// this only affects the order background work executes in.
+let backgroundQueue: Promise<void> = Promise.resolve();
+
+/**
+ * Express application.
+ */
+export type Application = ReturnType<typeof express>;
+
+/**
+ * Configuration options for the application.
+ */
+export type AppConfig = {
+	/**
+	 * The directory where application data will be stored enabling the application to persist data between restarts.
+	 *
+	 * @internal
+	 * During autograding, the directory will be deleted as a means to reset the application data between tests.
+	 */
+	readonly datadir: string;
+	readonly geolocator?: IGeoLocator
+};
+
+/**
+ * Initializes the application.
+ */
+export async function createApp(config: AppConfig): Promise<Application> {
+	const app = express();
+
+	const { datadir } = config;
+	const geoLocator = config.geolocator ?? new GeoLocator();
+
+	// initialize datadir singleton
+	DataDirectory.getInstance(datadir);
+	await DataDirectory.getInstance().makeDirectory();
+
+	// Configure multer to store file contents in memory
+	const upload = multer({ storage: multer.memoryStorage() });
+
+	// Make files in ../frontend/public accessible at http://localhost:<port>/
+	app.use(express.static("frontend/public"));
+
+	// Register middleware to parse request before passing them to request handlers
+	// Note: JSON parser must be place before raw parser because of wildcard matching done by raw parser below
+	app.use(express.json());
+	app.use(express.raw({ type: "application/*", limit: "10mb" }));
+	app.use(cors());
+
+	app.use(coursesRouter);
+	app.use(sectionsRouter);
+	const buildingService = new BuildingService(new FsBuildingRepository());
+	app.use(createBuildingsRouter(buildingService));
+	datasets.splice(0);
+
+	// Basic message to verify REST API is available
+	// You can see the message by going to http://localhost:<port>/api
+	app.get("/api", (_req, res) => {
+		res.send("App is running!");
+	});
+
+	app.post("/api/v2/datasets", upload.single("archive"), async (req, res) => {
+		const model = new Model(datadir);
+		const output = await model.postUpdatedDataset(req.body, req.file, buildingService, geoLocator);
+		res.status(output.status).json(output.body);
+	});
+
+	app.post("/api/v1/datasets", upload.single("archive"), async (req, res) => {
+		const model = new Model(datadir);
+		const output = await model.postDataset(req.body, req.file);
+		res.status(output.status).json(output.body);
+	});
+
+	app.get("/api/v1/datasets/:id", async (req, res) => {
+		const model = new Model(datadir);
+		const output = model.getDataset(req.params.id);
+		res.status(output.status).json(output.body);
+	});
+
+	app.get("/api/v2/datasets/:id", async (req, res) => {
+		const model = new Model(datadir);
+		const output = model.getDataset(req.params.id);
+		res.status(output.status).json(output.body);
+	});
+
+	app.post("/api/v1/search", async (req, res) => {
+		const model = new Model(datadir);
+		const output = await model.searchSectionsV1(req.body);
+		res.status(output.status).json(output.body);
+	});
+
+	app.post("/api/v2/search", async (req, res) => {
+		const model = new Model(datadir);
+		const output = await model.searchV2(req.body, buildingService);
+		res.status(output.status).json(output.body);
+	});
+
+	return app;
+}
+
+const SECTIONS_MKEY = ["avg", "pass", "fail", "audit", "year"];
+const SECTIONS_SKEY = ["title", "dept", "code", "instructor"];
+const ROOMS_MKEY = ["lat", "lon", "seats"];
+const ROOMS_SKEY = ["address", "building", "furniture", "href", "name", "number", "type", "campus"];
+const SECTIONS_KEY = [...SECTIONS_MKEY, ...SECTIONS_SKEY];
+const ROOMS_KEY = [...ROOMS_MKEY, ...ROOMS_SKEY];
+const MKEY = [...SECTIONS_MKEY, ...ROOMS_MKEY];
+const SKEY = [...SECTIONS_SKEY, ...ROOMS_SKEY];
+const KEY = [...MKEY, ...SKEY];
+
+type ApiOutput = { status: number; body?: any };
+
+export class Model {
+	constructor(private datadir: string) {}
+	public data: {
+		courses: Course[];
+	} = { courses: [] };
+
+	public async readCourses(): Promise<void> {
+		this.data.courses = await Course.getCourses();
+	}
+
+	public async writeCourses(): Promise<void> {
+		await Course.writeCourses(this.data.courses);
+	}
+
+	public async postDataset(body: any, file: any): Promise<ApiOutput> {
+		const valid = await validateDatasetParams(body, file);
+		if (!valid.valid) {
+			return {
+				status: 422,
+				body: {
+					error: "Validation failed",
+					fields: valid.fields,
+				},
+			};
+		}
+		const id = datasets.length;
+		const coursesDataset = new CoursesDataset(id, valid.zip, this.datadir, valid.is_valid_zip);
+		backgroundQueue = backgroundQueue
+			.then(() => coursesDataset.startProcess())
+			.catch(() => {
+				coursesDataset.status = "failed";
+				coursesDataset.message = "Unexpected error during processing";
+			});
+		datasets.push(coursesDataset);
+		return {
+			status: 202,
+			body: {
+				id: String(id),
+				status: "processing",
+				kind: "course_offerings",
+				message: "Dataset accepted for processing",
+			},
+		};
+	}
+
+	public async postUpdatedDataset(body: any, file: any, buildingService: BuildingService, geoLocator: IGeoLocator): Promise<ApiOutput> {
+		const valid = await validateNewDatasetParams(body, file);
+		if (!valid.valid) {
+			return {
+				status: 422,
+				body: {
+					error: "Validation failed",
+					fields: valid.fields,
+				},
+			};
+		}
+		const id = datasets.length;
+
+		if (valid.file_type === "facilities") {
+			const buildingsDataset = new BuildingsDataset(id, valid.zip, buildingService, geoLocator, valid.is_valid_zip);
+			backgroundQueue = backgroundQueue
+				.then(() => buildingsDataset.startProcess())
+				.catch(() => {
+					buildingsDataset.setFailMessage("Unexpected error during processing");
+				});
+			datasets.push(buildingsDataset);
+		} else {
+			const coursesDataset = new CoursesDataset(id, valid.zip, this.datadir, valid.is_valid_zip);
+			backgroundQueue = backgroundQueue
+				.then(() => coursesDataset.startProcess())
+				.catch(() => {
+					coursesDataset.status = "failed";
+					coursesDataset.message = "Unexpected error during processing";
+				});
+			datasets.push(coursesDataset);
+		}
+
+		return {
+			status: 202,
+			body: {
+				id: String(id),
+				status: "processing",
+				kind: valid.file_type,
+				message: "Dataset accepted for processing",
+			},
+		};
+	}
+	public getDataset(id: string): ApiOutput {
+		if (Number.isNaN(Number(id)) || Number(id) < 0 || Number(id) >= datasets.length) {
+			return {
+				status: 404,
+				body: {
+					error: "Not found",
+					message: `no dataset with id '${id}'`,
+				},
+			};
+		} else {
+			return {
+				status: 200,
+				body: datasets[Number(id)].report(),
+			};
+		}
+	}
+
+	public async searchSectionsV1(body: any): Promise<ApiOutput> {
+		const valid = validateSearchParamsV1(body);
+		if (!valid.valid) {
+			return {
+				status: 422,
+				body: {
+					error: "Validation failed",
+					fields: valid.fields,
+				},
+			};
+		}
+		await this.readCourses();
+		if (body.query.WHERE === undefined) return errorBadRequest("Missing WHERE");
+		else if (body.query.OPTIONS === undefined) return errorBadRequest("Missing OPTIONS");
+		else if (body.query.OPTIONS.COLUMNS === undefined) return errorBadRequest("Missing COLUMNS");
+		else if (!body.query.OPTIONS.COLUMNS.every((column: string) => SECTIONS_KEY.includes(column)))
+			return errorBadRequest("Unknown key in COLUMNS");
+		else if (body.query.OPTIONS.ORDER && !body.query.OPTIONS.COLUMNS.includes(body.query.OPTIONS.ORDER))
+			return errorBadRequest("ORDER must be a key in COLUMNS");
+		else if (
+			!Object.keys(body.query.OPTIONS).includes("COLUMNS") ||
+			Object.keys(body.query.OPTIONS).some((key) => key !== "COLUMNS" && key !== "ORDER")
+		)
+			return errorBadRequest("OPTIONS must be an object with COLUMNS and optional ORDER");
+
+		const sections: Section[] = [];
+		for (const course of this.data.courses) course.sections.map((section) => sections.push(section));
+		const filtered = filterQueryable(body.query.WHERE, sections, SECTIONS_MKEY, SECTIONS_SKEY);
+		if (filtered.error && filtered.error !== "no filter") {
+			if (filtered.error === "not filter") filtered.error = "WHERE must be an object with at most one FILTER";
+			return errorBadRequest(filtered.error);
+		} else if (filtered.list.length > RESULT_LIMIT) {
+			return {
+				status: 413,
+				body: {
+					error: "Too many results",
+					message: "Query would return more than 5000 results",
+					limit: RESULT_LIMIT,
+				},
+			};
+		}
+		// select the right COLUMNS and sort them in the correct ORDER here
+		const infoArr = [];
+		for (const section of filtered.list) {
+			const info: any = {};
+			for (const column of body.query.OPTIONS.COLUMNS)
+				if (SECTIONS_KEY.includes(column)) info[column] = section.getValue(column);
+			infoArr.push(info);
+		}
+		infoArr.sort((a, b) => ordering(a, b, [body.query.OPTIONS.ORDER]));
+		return {
+			status: 200,
+			body: infoArr,
+		};
+	}
+
+	public async searchV2(body: any, buildingService: BuildingService): Promise<ApiOutput> {
+		const valid = validateSearchParamsV2(body);
+		if (!valid.valid) {
+			return {
+				status: 422,
+				body: {
+					error: "Validation failed",
+					fields: valid.fields,
+				},
+			};
+		}
+		if (body.kind === "course_offerings") await this.readCourses();
+
+		let allKeys = structuredClone(KEY);
+		if (body.query.WHERE === undefined) return errorBadRequest("Missing WHERE");
+		if (body.query.OPTIONS === undefined) return errorBadRequest("Missing OPTIONS");
+		if (body.query.OPTIONS.COLUMNS === undefined) return errorBadRequest("Missing COLUMNS");
+
+		if (body.query.TRANSFORMATIONS !== undefined && body.query.TRANSFORMATIONS !== null) {
+			if (body.query.TRANSFORMATIONS.GROUP === undefined) return errorBadRequest("Missing GROUP in TRANSFORMATIONS");
+			if (body.query.TRANSFORMATIONS.APPLY === undefined) return errorBadRequest("Missing APPLY in TRANSFORMATIONS");
+			if (!Array.isArray(body.query.TRANSFORMATIONS.GROUP) || body.query.TRANSFORMATIONS.GROUP.length < 1)
+				return errorBadRequest("GROUP must be a non-empty array");
+			if (!body.query.TRANSFORMATIONS.GROUP.every((key: string) => KEY.includes(key)))
+				return errorBadRequest("GROUP must only contain valid keys");
+			if (!Array.isArray(body.query.TRANSFORMATIONS.APPLY)) return errorBadRequest("APPLY must be an array");
+
+			const applyKeys: string[] = body.query.TRANSFORMATIONS.APPLY.map(
+				(applyRule: Object) => Object.keys(applyRule)[0]
+			);
+			if (
+				!body.query.OPTIONS.COLUMNS.every(
+					(column: string) => body.query.TRANSFORMATIONS.GROUP.includes(column) || applyKeys.includes(column)
+				)
+			)
+				return errorBadRequest("When TRANSFORMATIONS is present, all COLUMNS must be in GROUP or APPLY");
+			if (applyKeys.some((applyKey, index) => applyKeys.indexOf(applyKey) !== index))
+				return errorBadRequest("Duplicate applykey in APPLY");
+			if (applyKeys.some((applyKey) => !applyKey || includeString(applyKey, "_", false, false)))
+				return errorBadRequest("applykey cannot be empty or contain underscore");
+
+			const apply = body.query.TRANSFORMATIONS.APPLY;
+			const applyTokens = apply.map((applyRule: Object) => Object.values(applyRule)[0]);
+			if (
+				!applyTokens.every((applyToken: Object) =>
+					["MAX", "MIN", "SUM", "AVG", "COUNT"].includes(Object.keys(applyToken)[0])
+				)
+			)
+				return errorBadRequest("Invalid APPLYTOKEN (must be MAX, MIN, AVG, COUNT, or SUM)");
+
+			const appliedKeys = applyTokens.map((applyToken: Object) => Object.values(applyToken)[0]);
+			if (
+				!appliedKeys.every((key: any) => KEY.includes(key)) ||
+				applyTokens.some((applyToken: Object) => Object.keys(applyToken).length !== 1)
+			)
+				return errorBadRequest("APPLYRULE must apply aggregation to a valid KEY");
+			if (body.kind === "course_offerings" && appliedKeys.some((key: any) => ROOMS_KEY.includes(key)))
+				return errorBadRequest("Cannot mix course_offerings and facilities fields in one query");
+			if (body.kind === "facilities" && appliedKeys.some((key: any) => SECTIONS_KEY.includes(key)))
+				return errorBadRequest("Cannot mix course_offerings and facilities fields in one query");
+
+			if (
+				!applyTokens.every(
+					(applyToken: Object) => Object.keys(applyToken)[0] === "COUNT" || MKEY.includes(Object.values(applyToken)[0])
+				)
+			)
+				return errorBadRequest("MAX/MIN/AVG/SUM can only be applied to mfields");
+
+			allKeys = [...allKeys, ...applyKeys];
+		}
+		if (!body.query.OPTIONS.COLUMNS.every((column: string) => allKeys.includes(column)))
+			return errorBadRequest("Unknown key in COLUMNS");
+		if (Object.keys(body.query.OPTIONS).some((key) => key !== "COLUMNS" && key !== "ORDER"))
+			return errorBadRequest("OPTIONS must be an object with COLUMNS and optional ORDER");
+		if (body.query.OPTIONS.ORDER !== undefined && body.query.OPTIONS.ORDER !== null) {
+			if (typeof body.query.OPTIONS.ORDER === "string") {
+				if (!body.query.OPTIONS.COLUMNS.includes(body.query.OPTIONS.ORDER))
+					return errorBadRequest("ORDER must be a key in COLUMNS");
+			} else {
+				if (
+					!Array.isArray(body.query.OPTIONS.ORDER.keys) ||
+					body.query.OPTIONS.ORDER.keys.length < 1 ||
+					body.query.OPTIONS.ORDER.keys.some((key: any) => !body.query.OPTIONS.COLUMNS.includes(key))
+				)
+					return errorBadRequest("All ORDER keys must be in COLUMNS");
+				if (!["UP", "DOWN"].includes(body.query.OPTIONS.ORDER.dir))
+					return errorBadRequest("Invalid sort direction (must be UP or DOWN)");
+			}
+		}
+		let filtered: { error: string; list: Queryable[] } = {
+			error: "",
+			list: [],
+		};
+		if (body.kind === "course_offerings") {
+			if (body.query.OPTIONS.COLUMNS.some((column: string) => ROOMS_KEY.includes(column)))
+				return errorBadRequest("Cannot mix course_offerings and facilities fields in one query");
+			const sections: Section[] = [];
+			for (const course of this.data.courses) course.sections.map((section) => sections.push(section));
+			filtered = filterQueryable(body.query.WHERE, sections, SECTIONS_MKEY, SECTIONS_SKEY);
+		} else if (body.kind === "facilities") {
+			if (body.query.OPTIONS.COLUMNS.some((column: string) => SECTIONS_KEY.includes(column)))
+				return errorBadRequest("Cannot mix course_offerings and facilities fields in one query");
+			const rooms: Room[] = await buildingService.getAllRooms();
+			filtered = filterQueryable(body.query.WHERE, rooms, ROOMS_MKEY, ROOMS_SKEY);
+		}
+		if (filtered.error && filtered.error !== "no filter") {
+			if (filtered.error === "not filter") filtered.error = "WHERE must be an object with at most one FILTER";
+			return errorBadRequest(filtered.error);
+		} else if (filtered.list.length > RESULT_LIMIT) {
+			return {
+				status: 413,
+				body: {
+					error: "Too many results",
+					message: "Query would return more than 5000 results",
+					limit: RESULT_LIMIT,
+				},
+			};
+		}
+		const infoArr = [];
+		if (body.query.TRANSFORMATIONS === undefined) {
+			for (const entry of filtered.list) {
+				const info: any = {};
+				for (const column of body.query.OPTIONS.COLUMNS) {
+					if (KEY.includes(column)) info[column] = entry.getValue(column);
+				}
+				infoArr.push(info);
+			}
+		} else {
+			const transformed = transformList(filtered.list, body.query.TRANSFORMATIONS);
+			for (const entry of transformed) {
+				const info: any = {};
+				for (const column of body.query.OPTIONS.COLUMNS) {
+					info[column] = entry[column];
+				}
+				infoArr.push(info);
+			}
+		}
+
+		let multiplier = 1;
+		let order: string[] = [];
+		if (typeof body.query.OPTIONS.ORDER === "string") order = [body.query.OPTIONS.ORDER];
+		else if (body.query.OPTIONS.ORDER !== undefined && body.query.OPTIONS.ORDER !== null) {
+			multiplier = ["DOWN", "UP"].indexOf(body.query.OPTIONS.ORDER.dir) * 2 - 1; // 1 for UP, -1 for DOWN
+			order = body.query.OPTIONS.ORDER.keys;
+		}
+		infoArr.sort((a, b) => ordering(a, b, order) * multiplier);
+		return {
+			status: 200,
+			body: infoArr,
+		};
+	}
+}
+
+abstract class Dataset {
+	constructor(public id: number) {}
+
+	public abstract report(): Object;
+	public abstract startProcess(): Promise<void>;
+}
+
+type ParseNode = parse5.DefaultTreeAdapterTypes.ChildNode;
+type ParseElement = parse5.DefaultTreeAdapterTypes.Element;
+
+type BuildingStatus = {
+	status: string;
+	buildings_added: number;
+	buildings_modified: number;
+	rooms_added: number;
+	rooms_modified: number;
+	message: string;
+};
+
+type BuildingInfo = {
+	fullname: string;
+	shortname: string;
+	address: string;
+	link: string | undefined;
+};
+
+class BuildingsDataset extends Dataset {
+	constructor(
+		public id: number,
+		private dir: JSZip, // Some .htm file?
+		private buildingService: BuildingService,
+		private geoLocator: IGeoLocator,
+		private isValidZip: Boolean
+	) {
+		super(id);
+		this.valid_zip = isValidZip;
+		this.htmlFileDir = dir;
+	}
+
+	private valid_zip;
+	private htmlFileDir;
+
+	private buildings_status: BuildingStatus = {
+		status: "processing",
+		buildings_added: 0,
+		buildings_modified: 0,
+		rooms_added: 0,
+		rooms_modified: 0,
+		message: "Processing in progress",
+	};
+
+	public report(): Object {
+		if (this.buildings_status.status === "completed") {
+			return {
+				id: String(this.id),
+				status: this.buildings_status.status,
+				kind: "facilities",
+				stats: {
+					buildings_added: this.buildings_status.buildings_added,
+					buildings_modified: this.buildings_status.buildings_modified,
+					rooms_added: this.buildings_status.rooms_added,
+					rooms_modified: this.buildings_status.rooms_modified,
+				},
+				message: this.buildings_status.message,
+			};
+		} else {
+			return {
+				id: String(this.id),
+				status: this.buildings_status.status,
+				kind: "facilities",
+				stats: {
+					buildings_added: 0,
+					buildings_modified: 0,
+					rooms_added: 0,
+					rooms_modified: 0,
+				},
+				message: this.buildings_status.message,
+			};
+		}
+	}
+
+	public setFailMessage(message: string): void {
+		this.buildings_status = {
+			status: "failed",
+			buildings_added: 0,
+			buildings_modified: 0,
+			rooms_added: 0,
+			rooms_modified: 0,
+			message: message,
+		};
+	}
+
+	// THIS FUNCTION WAS WRITTEN BY AI //
+	private getTextFromNode(node: any): string {
+		let text = "";
+		if (node.nodeName === "#text" && node.value) {
+			text += node.value.trim();
+		}
+		if (node.childNodes) {
+			for (const child of node.childNodes) {
+				text += this.getTextFromNode(child);
+			}
+		}
+		return text.trim();
+	}
+
+	// THIS FUNCTION WAS WRITTEN BY AI //
+	private getHrefFromNode(node: any): string | undefined {
+		if (node.nodeName === "a") {
+			for (const attr of node.attrs) {
+				if (attr.name === "href") {
+					return attr.value;
+				}
+			}
+		}
+		if (node.childNodes) {
+			for (const child of node.childNodes) {
+				const href = this.getHrefFromNode(child);
+				if (href) return href;
+			}
+		}
+		return undefined;
+	}
+
+	private searchChildForElement(node: ParseNode, className: string): ParseElement | undefined {
+		let result: ParseElement | undefined = undefined;
+
+		const elem: any = node;
+		if (!("childNodes" in elem)) {
+			// base case 1
+			return undefined;
+		}
+
+		if (this.hasClass(elem, className)) {
+			const element: ParseElement = elem;
+			return element; // base case 2
+		} else {
+			elem.childNodes.forEach((child: ParseNode) => {
+				const res = this.searchChildForElement(child, className);
+				if (res !== undefined && res !== null) {
+					result = res;
+				}
+			});
+		}
+
+		return result;
+	}
+
+	private findTable(document: parse5.DefaultTreeAdapterTypes.Document): ParseElement | undefined {
+		let result: ParseElement | undefined = undefined;
+		document.childNodes.forEach((child) => {
+			const tableNode: ParseElement | undefined = this.searchChildForElement(child, "views-table");
+
+			if (tableNode !== undefined && tableNode !== null) {
+				result = tableNode;
+			}
+		});
+
+		return result;
+	}
+
+	private async extractIndex(): Promise<parse5.DefaultTreeAdapterTypes.Document | undefined> {
+		if (!this.valid_zip) {
+			this.setFailMessage("Data is not in a valid zip format");
+			return undefined;
+		}
+
+		try {
+			const file = this.htmlFileDir.file("index.htm");
+
+			if (!file) {
+				this.setFailMessage("Missing index.htm file");
+				return undefined;
+			}
+
+			try {
+				const fileAsString = await file.async("string");
+
+				try {
+					return parse5.parse(fileAsString);
+				} catch {
+					this.setFailMessage("index.htm could not be parsed");
+				}
+			} catch {
+				this.setFailMessage("Data is not in a valid zip format");
+			}
+		} catch {
+			this.setFailMessage("Failed to fetch any file from directory");
+		}
+
+		return undefined;
+	}
+
+	private allBuildingFieldsPresent(
+		a: ParseElement | undefined,
+		b: ParseElement | undefined,
+		c: ParseElement | undefined,
+		d: ParseElement | undefined
+	): boolean {
+		return (
+			a !== undefined &&
+			a !== null &&
+			b !== undefined &&
+			b !== null &&
+			c !== undefined &&
+			c !== null &&
+			d !== undefined &&
+			d !== null
+		);
+	}
+
+	private allRoomFieldsPresent(
+		a: ParseElement | undefined,
+		b: ParseElement | undefined,
+		c: ParseElement | undefined,
+		d: ParseElement | undefined,
+		e: ParseElement | undefined
+	): boolean {
+		return (
+			a !== undefined &&
+			a !== null &&
+			b !== undefined &&
+			b !== null &&
+			c !== undefined &&
+			c !== null &&
+			d !== undefined &&
+			d !== null &&
+			e !== undefined &&
+			e !== null
+		);
+	}
+
+	private hasClass(elem: ParseElement, str: string): boolean {
+		for (const attr of elem.attrs) {
+			if (attr.name === "class" && attr.value.split(" ").includes(str)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private findFullname(row: ParseNode): ParseElement | undefined {
+		return this.searchChildForElement(row, "views-field-title");
+	}
+
+	private findShortname(row: ParseNode): ParseElement | undefined {
+		return this.searchChildForElement(row, "views-field-field-building-code");
+	}
+
+	private findAddress(row: ParseNode): ParseElement | undefined {
+		return this.searchChildForElement(row, "views-field-field-building-address");
+	}
+
+	private findLink(row: ParseNode): ParseElement | undefined {
+		return this.searchChildForElement(row, "views-field-title");
+	}
+
+	private findRoomNumber(row: ParseNode): ParseElement | undefined {
+		return this.searchChildForElement(row, "views-field-field-room-number");
+	}
+
+	private findSeats(row: ParseNode): ParseElement | undefined {
+		return this.searchChildForElement(row, "views-field-field-room-capacity");
+	}
+
+	private findFurniture(row: ParseNode): ParseElement | undefined {
+		return this.searchChildForElement(row, "views-field-field-room-furniture");
+	}
+
+	private findRoomType(row: ParseNode): ParseElement | undefined {
+		return this.searchChildForElement(row, "views-field-field-room-type");
+	}
+
+	private findHREF(row: ParseNode): ParseElement | undefined {
+		return this.searchChildForElement(row, "views-field-nothing");
+	}
+
+	private async extractBuildings(table: ParseElement): Promise<Pair<Building, string>[]> {
+		const rows: ParseNode[] = this.extractRowsFromTable(table);
+		const buildingsInfo: BuildingInfo[] = [];
+		const buildings: Pair<Building, string>[] = [];
+
+		rows.forEach((row: ParseNode) => {
+			const fullnameNode = this.findFullname(row);
+			const shortnameNode = this.findShortname(row);
+			const addressNode = this.findAddress(row);
+			const linkNode = this.findLink(row);
+
+			if (this.allBuildingFieldsPresent(fullnameNode, shortnameNode, addressNode, linkNode)) {
+				const fullname = this.getTextFromNode(fullnameNode);
+				const shortname = this.getTextFromNode(shortnameNode);
+				const address = this.getTextFromNode(addressNode);
+				const link = this.getHrefFromNode(linkNode);
+
+				if (link) {
+					const building: BuildingInfo = {
+						fullname: fullname,
+						shortname: shortname,
+						address: address,
+						link: link,
+					};
+
+					buildingsInfo.push(building);
+				}
+			}
+		});
+
+		// console.log("buildings info: ", buildingsInfo, "\n");
+
+		await Promise.all(
+			buildingsInfo.map(async (building: BuildingInfo, index: number) => {
+				const res = await this.geoLocator.searchCoordinates(building.address);
+
+				if (
+					res.success &&
+					res.lat &&
+					res.lon &&
+					building.link !== undefined &&
+					building.link !== null &&
+					validateBuildingParams(building.fullname, building.address, res.lat, res.lon)
+				) {
+					// console.log("building validated\n");
+					const { shortname, fullname, address } = building;
+					const bldng = new Building(shortname, fullname, address, res.lat, res.lon);
+					const pair: Pair<Building, string> = { first: bldng, second: building.link };
+					buildings.push(pair);
+				}
+			})
+		);
+
+		return buildings;
+	}
+
+	private async traverseDirectory(fileDir: JSZip, path: string): Promise<string | undefined> {
+		const normalizedPath = path.startsWith("./") ? path.slice(2) : path;
+		return await this.htmlFileDir.file(normalizedPath)?.async("string");
+	}
+
+	// THE FUNCTION BELOW WAS GENERATED BY AI
+	private extractRowsFromTable(table: ParseElement): ParseElement[] {
+		const rows: ParseElement[] = [];
+
+		for (const child of table.childNodes) {
+			const section = child as ParseElement;
+			if (section.nodeName === "tbody") {
+				for (const row of section.childNodes) {
+					const tr = row as ParseElement;
+					if (tr.nodeName === "tr") {
+						rows.push(tr);
+					}
+				}
+			}
+		}
+
+		return rows;
+	}
+
+	private async extractRooms(buildings: Pair<Building, string>[]): Promise<Building[]> {
+		await Promise.all(
+			buildings.map(async (building: Pair<Building, string>) => {
+				const link = building.second;
+
+				const htmlString = await this.traverseDirectory(this.htmlFileDir, link);
+				if (htmlString !== undefined && htmlString !== null) {
+					try {
+						const buildingJSON: parse5.DefaultTreeAdapterTypes.Document = parse5.parse(htmlString);
+
+						//change
+						for (const child of buildingJSON.childNodes) {
+							const campusObject = this.searchChildForElement(child, "ubc7-campus");
+							if (campusObject) {
+								const campusString = this.getTextFromNode(campusObject);
+								if (campusString) {
+									building.first.campus = campusString;
+								}
+							}
+						}
+
+						const roomsTable: ParseElement | undefined = this.findTable(buildingJSON);
+
+						if (roomsTable !== undefined && roomsTable !== null) {
+							const rows = this.extractRowsFromTable(roomsTable);
+
+							for (const row of rows) {
+								const roomNumberNode = this.findRoomNumber(row);
+								const seatsNode = this.findSeats(row);
+								const furnitureNode = this.findFurniture(row);
+								const roomTypeNode = this.findRoomType(row);
+								const hrefNode = this.findHREF(row);
+
+								const allPresent = this.allRoomFieldsPresent(
+									roomNumberNode,
+									seatsNode,
+									furnitureNode,
+									roomTypeNode,
+									hrefNode
+								);
+								if (allPresent) {
+									const roomNumber = this.getTextFromNode(roomNumberNode);
+									const seats = Number(this.getTextFromNode(seatsNode).trim());
+									const furniture = this.getTextFromNode(furnitureNode);
+									const roomType = this.getTextFromNode(roomTypeNode);
+									const href = this.getHrefFromNode(hrefNode);
+
+									if (
+										href !== undefined &&
+										href !== null &&
+										validateRoomParams(
+											{
+												building: building.first.id,
+												number: roomNumber,
+												type: roomType,
+												furniture: furniture,
+												href: href,
+												seats: seats,
+											},
+											building.first.id
+										).valid
+									) {
+										const room: Room = new Room(
+											building.first.id + roomNumber,
+											building.first.id,
+											roomNumber,
+											roomType,
+											furniture,
+											href,
+											seats,
+											building.first
+										);
+										building.first.rooms.push(room);
+									}
+								}
+							}
+						}
+					} catch {
+						// console.log("incorrect html format, unable to parse\n");
+					}
+				} else {
+					// console.log("no file found at location %s\n", link);
+				}
+			})
+		);
+
+		const loadedBuildings: Building[] = buildings.map((building) => {
+			return building.first;
+		});
+
+		return loadedBuildings;
+	}
+
+	private buildingParamsMatch(b1: Building, b2: Building): boolean {
+		return (
+			b1.lat === b2.lat &&
+			b1.lon === b2.lon &&
+			b1.name === b2.name &&
+			b1.address === b2.address &&
+			b1.campus === b2.campus
+		);
+	}
+
+	private roomParamsMatch(r1: Room, r2: Room): boolean {
+		return (
+			r1.building === r2.building &&
+			r1.number === r2.number &&
+			r1.seats === r2.seats &&
+			r1.type === r2.type &&
+			r1.furniture === r2.furniture &&
+			r1.href === r2.href
+		);
+	}
+
+	private pairifyBuildings(buildings: Building[], bool: boolean): BuildingChangePair[] {
+		const originalPair: BuildingChangePair[] = buildings.map((building) => {
+			const roomsPair = this.pairifyRooms(building.rooms, bool);
+
+			return { first: { first: building, second: roomsPair }, second: bool };
+		});
+
+		return originalPair;
+	}
+
+	private pairifyRooms(rooms: Room[], bool: boolean): Pair<Room, boolean>[] {
+		const roomsPair = rooms.map((room: Room) => {
+			return { first: room, second: bool };
+		});
+
+		return roomsPair;
+	}
+
+	private unPairifyBuildings(building_pairs: BuildingChangePair[]): Building[] {
+		const buildings: Building[] = building_pairs.map((building_pair: BuildingChangePair) => {
+			const rooms: Room[] = building_pair.first.second.map((room_pair) => {
+				return room_pair.first;
+			});
+
+			building_pair.first.first.rooms = rooms;
+			return building_pair.first.first;
+		});
+
+		return buildings;
+	}
+
+	private combineRooms(match: BuildingChangePair, building: Building): BuildingChangePair {
+		building.rooms.forEach((room: Room) => {
+			const roomMatch: Pair<Room, boolean> | undefined = match.first.second.find((og: Pair<Room, boolean>) => {
+				return og.first.id === room.id;
+			});
+
+			if (roomMatch === undefined || roomMatch === null) {
+				match.first.second.push({ first: room, second: false });
+				this.buildings_status.rooms_added++;
+			} else if (!this.roomParamsMatch(room, roomMatch.first)) {
+				roomMatch.first.building = room.building;
+				roomMatch.first.number = room.number;
+				roomMatch.first.seats = room.seats;
+				roomMatch.first.type = room.type;
+				roomMatch.first.furniture = room.furniture;
+				roomMatch.first.href = room.href;
+
+				if (roomMatch.second) {
+					this.buildings_status.rooms_modified++;
+					// console.log("modifying room\n");
+					roomMatch.second = false;
+				}
+			}
+		});
+
+		return match;
+	}
+
+	private combineBuildings(buildings: Building[], original: Building[]): Building[] {
+		const originalPair: BuildingChangePair[] = this.pairifyBuildings(original, true);
+
+		buildings.forEach((building: Building) => {
+			let match: BuildingChangePair | undefined = originalPair.find(
+				(og: BuildingChangePair) => og.first.first.id === building.id
+			);
+			if (match === undefined || match === null) {
+				this.buildings_status.buildings_added++;
+				// console.log("adding building\n");
+				building.rooms.forEach(() => this.buildings_status.rooms_added++);
+				// console.log("adding rooms\n");
+				originalPair.push({
+					first: { first: building, second: this.pairifyRooms(building.rooms, false) },
+					second: false,
+				});
+			} else if (!this.buildingParamsMatch(building, match.first.first)) {
+				match.first.first.name = building.name;
+				match.first.first.address = building.address;
+				match.first.first.lat = building.lat;
+				match.first.first.lon = building.lon;
+				match.first.first.campus = building.campus;
+
+				match = this.combineRooms(match, building);
+
+				if (match.second) {
+					// console.log("modifying building\n");
+					this.buildings_status.buildings_modified++;
+					match.second = false;
+				}
+			} else {
+				match = this.combineRooms(match, building);
+			}
+		});
+
+		const result: Building[] = this.unPairifyBuildings(originalPair);
+
+		return result;
+	}
+
+	private async uploadBuildingsData(buildings: Building[]): Promise<void> {
+		const original: Building[] = await this.buildingService.getBuildings();
+
+		const newBuildings: Building[] = this.combineBuildings(buildings, original);
+
+		await this.buildingService.saveBuildings(newBuildings);
+
+		this.buildings_status.status = "completed";
+		this.buildings_status.message = "Dataset processing complete";
+	}
+
+	public async startProcess(): Promise<void> {
+		const parsedDocument: parse5.DefaultTreeAdapterTypes.Document | undefined = await this.extractIndex();
+
+		// console.log("starting process\n");
+		if (parsedDocument) {
+			const table: ParseElement | undefined = this.findTable(parsedDocument);
+
+			// console.log("table ", table, "\n");
+			if (table !== undefined && table !== null) {
+				await this.processTable(table);
+			} else {
+				this.setFailMessage("No building table found in index.htm");
+			}
+		}
+	}
+
+	private async processTable(table: ParseElement): Promise<void> {
+		const emptyBuildings: Pair<Building, string>[] = await this.extractBuildings(table);
+		// console.log("buildings: ", emptyBuildings);
+		const buildings: Building[] = await this.extractRooms(emptyBuildings);
+		// console.log("buildings with rooms: ", buildings);
+
+		// console.log("uploading data");
+		await this.uploadBuildingsData(buildings);
+	}
+}
+
+type Pair<T1, T2> = {
+	first: T1;
+	second: T2;
+};
+
+type BuildingChangePair = Pair<Pair<Building, Pair<Room, boolean>[]>, boolean>;
+
+class CoursesDataset extends Dataset {
+	constructor(
+		public id: number,
+		private dir: JSZip,
+		private datadir: string,
+		private isValidZip: Boolean
+	) {
+		super(id);
+	}
+
+	public status: string = "processing";
+	public files: number[] = [0, 0, 0]; // total, processed, skipped
+	public courses: number[] = [0, 0, 0]; // seen, added, modified
+	public sections: number[] = [0, 0, 0]; // seen, added, modified
+	public message: string = "Processing in progress";
+	private all_courses_map: Map<string, Pair<Pair<Course, Array<Pair<Section, Boolean>>>, Boolean>> = new Map<
+		string,
+		Pair<Pair<Course, Array<Pair<Section, Boolean>>>, Boolean>
+	>();
+	private all_courses_list: Array<string> = [];
+	private title: string = "";
+	private list_of_keys: Array<[string, string]> = [
+		["id", "string"],
+		["Course", "string"],
+		["Title", "string"],
+		["Professor", "string"],
+		["Subject", "string"],
+		["Section", "string"],
+		["Year", "string"],
+		["Avg", "number"],
+		["Pass", "number"],
+		["Fail", "number"],
+		["Audit", "number"],
+	];
+	private fileCount = 0;
+
+	public report(): Object {
+		if (this.status === "completed") {
+			return {
+				id: String(this.id),
+				status: this.status,
+				kind: "course_offerings",
+				stats: {
+					files_total: this.files[0],
+					files_processed: this.files[1],
+					files_skipped: this.files[2],
+					courses_seen: this.courses[0],
+					courses_added: this.courses[1],
+					courses_modified: this.courses[2],
+					sections_seen: this.sections[0],
+					sections_added: this.sections[1],
+					sections_modified: this.sections[2],
+				},
+				message: this.message,
+			};
+		} else {
+			return {
+				id: String(this.id),
+				status: this.status,
+				kind: "course_offerings",
+				stats: {
+					files_total: 0,
+					files_processed: 0,
+					files_skipped: 0,
+					courses_seen: 0,
+					courses_added: 0,
+					courses_modified: 0,
+					sections_seen: 0,
+					sections_added: 0,
+					sections_modified: 0,
+				},
+				message: this.message,
+			};
+		}
+	}
+
+	public async startProcess(): Promise<void> {
+		// convert courses into a map, store all courseIds in a list
+		const model = new Model(this.datadir);
+		await model.readCourses();
+		const rawCourses = model.data.courses;
+		rawCourses.forEach((course: Course) => {
+			const sectionPairs = course.sections.map((section) => {
+				const newsection: Pair<Section, Boolean> = { first: section, second: true };
+				return newsection;
+			});
+
+			const newCourse: Pair<Course, Array<Pair<Section, Boolean>>> = { first: course, second: sectionPairs };
+			this.all_courses_map.set(course.id, { first: newCourse, second: true });
+			this.all_courses_list.push(course.id);
+		});
+
+		if (!this.isValidZip) {
+			this.status = "failed";
+			this.message = "Data is not in a valid zip format";
+			return;
+		}
+
+		const coursesExist = this.dir.folder(/courses/).length > 0;
+		if (!coursesExist) {
+			this.status = "failed";
+			this.message = "Missing root courses directory";
+			return;
+		}
+
+		const courses = this.dir.folder("courses");
+		if (!courses) {
+			return;
+		}
+
+		await Promise.all(
+			Object.values(courses.files)
+				.filter((file) => !file.dir && file.name.startsWith("courses/"))
+				.map(async (file) => {
+					try {
+						await this.processFile(file);
+					} catch {
+						this.files[2]++; // skip file
+					}
+				})
+		);
+
+		this.courses[0] = this.courses[1] + this.courses[2];
+		this.sections[0] = this.sections[1] + this.sections[2];
+
+		const updatedCourses: Array<Course> = [];
+		this.all_courses_list.map((courseId) => {
+			if (this.all_courses_map.has(courseId)) {
+				const pushCourse: Course | undefined = this.all_courses_map.get(courseId)?.first.first;
+				if (pushCourse) {
+					updatedCourses.push(pushCourse);
+				}
+			}
+		});
+
+		model.data.courses = updatedCourses;
+		await model.writeCourses();
+
+		this.status = "completed";
+		this.message = "Dataset processing complete";
+	}
+
+	private async processFile(file: JSZip.JSZipObject): Promise<void> {
+		this.files[0]++;
+
+		const text = await file.async("string");
+		const data = JSON.parse(text);
+
+		if (!("result" in data) || !Array.isArray(data.result)) {
+			this.files[2]++; // skipped
+			return;
+		}
+
+		if (data.result.length === 0) {
+			this.files[1]++;
+			return;
+		}
+
+		for (const entry of data.result) {
+			// Validate required fields exist
+			const hasAllFields = this.list_of_keys.every((key) => key[0] in entry);
+			if (!hasAllFields) {
+				this.files[2]++;
+				continue; // skip bad entries silently
+			}
+
+			// ---- Normalize values ----
+			const courseId = `${entry.Subject}${entry.Course}`;
+			const title = String(entry.Title);
+			const dept = String(entry.Subject);
+			const code = String(entry.Course);
+
+			const year = entry.Section === "overall" ? OVERALL_SECTION_YEAR : Number(entry.Year);
+
+			const avg = Number(entry.Avg);
+			const pass = Number(entry.Pass);
+			const fail = Number(entry.Fail);
+			const audit = Number(entry.Audit);
+
+			// ---- COURSE HANDLING ----
+			let coursePair = this.all_courses_map.get(courseId);
+			//const courseExisted = !!course;
+
+			if (coursePair === undefined || coursePair === null) {
+				const newCourse = new Course(courseId, title, dept, code);
+				coursePair = { first: { first: newCourse, second: [] }, second: false };
+				this.all_courses_map.set(courseId, coursePair);
+				this.all_courses_list.push(courseId);
+				this.courses[1]++; // courses_added
+			} else {
+				const course = coursePair.first.first;
+				// Check if metadata changed
+				const notChanged = course.title === title && course.dept === dept && course.code === code;
+
+				if (!notChanged) {
+					course.title = title;
+					course.dept = dept;
+					course.code = code;
+
+					if (coursePair.second) {
+						this.courses[2]++; // courses_modified
+						coursePair.second = false;
+					}
+				}
+			}
+
+			// ---- SECTION HANDLING ----
+			const course = coursePair.first;
+			const existingSectionPair = course.second.find((section_pair) => section_pair.first.id === entry.id);
+
+			if (existingSectionPair === undefined || existingSectionPair === null) {
+				const newSection = new Section(
+					String(entry.id),
+					String(entry.Professor),
+					year,
+					avg,
+					pass,
+					fail,
+					audit,
+					course.first
+				);
+				course.second.push({ first: newSection, second: false });
+				course.first.sections.push(newSection);
+				this.sections[1]++; // sections_added
+			} else {
+				const section: Section = existingSectionPair.first;
+				const sectionInCourse: Section | undefined = course.first.sections.find((sec) => section.id === sec.id);
+
+				const changed =
+					section.instructor !== String(entry.Professor) ||
+					section.year !== year ||
+					section.avg !== avg ||
+					section.pass !== pass ||
+					section.fail !== fail ||
+					section.audit !== audit;
+
+				if (changed && sectionInCourse !== undefined && sectionInCourse !== null) {
+					section.instructor = String(entry.Professor);
+					sectionInCourse.instructor = String(entry.Professor);
+					section.year = year;
+					sectionInCourse.year = year;
+					section.avg = avg;
+					sectionInCourse.avg = avg;
+					section.pass = pass;
+					sectionInCourse.pass = pass;
+					section.fail = fail;
+					sectionInCourse.fail = fail;
+					section.audit = audit;
+					sectionInCourse.audit = audit;
+
+					if (existingSectionPair.second) {
+						this.sections[2]++; // sections_modified
+						existingSectionPair.second = false;
+					}
+				}
+			}
+		}
+
+		this.files[1]++; // files_processed
+	}
+}
+
+function filterQueryable(
+	query: any,
+	items: Queryable[],
+	validMKeys: string[],
+	validSKeys: string[]
+): { error: string; list: Queryable[] } {
+	if (typeof query !== "object" || Object.keys(query).length > 1) {
+		return {
+			error: "not filter",
+			list: [],
+		};
+	} else if (query.AND !== undefined && query.AND !== null) {
+		if (
+			!Array.isArray(query.AND) ||
+			query.AND.length < 1 ||
+			!query.AND.every((filter: any) => typeof filter === "object")
+		) {
+			return {
+				error: "AND must be a non-empty array of FILTER objects",
+				list: [],
+			};
+		}
+		let newList = [...items];
+		for (const filter of query.AND) {
+			const filtered = filterQueryable(filter, items, validMKeys, validSKeys);
+			if (filtered.error) {
+				if (filtered.error === "no filter" || filtered.error === "not filter") {
+					return {
+						error: "AND must be a non-empty array of FILTER objects",
+						list: [],
+					};
+				} else return filtered;
+			}
+			newList = newList.filter((item) => filtered.list.some((other) => item.isSame(other)));
+		}
+		return {
+			error: "",
+			list: [...newList],
+		};
+	} else if (query.OR !== undefined && query.OR !== null) {
+		if (
+			!Array.isArray(query.OR) ||
+			query.OR.length < 1 ||
+			!query.OR.every((filter: any) => typeof filter === "object")
+		) {
+			return {
+				error: "OR must be a non-empty array of FILTER objects",
+				list: [],
+			};
+		}
+		let newList: Queryable[] = [];
+		for (const filter of query.OR) {
+			const filtered = filterQueryable(filter, items, validMKeys, validSKeys);
+			if (filtered.error) {
+				if (filtered.error === "no filter" || filtered.error === "not filter") {
+					return {
+						error: "OR must be a non-empty array of FILTER objects",
+						list: [],
+					};
+				} else return filtered;
+			}
+			newList = [...newList, ...filtered.list.filter((other) => newList.every((item) => !other.isSame(item)))];
+		}
+		return {
+			error: "",
+			list: newList,
+		};
+	} else if (query.NOT !== undefined && query.NOT !== null) {
+		if (typeof query.NOT !== "object") {
+			return {
+				error: "NOT must be a FILTER object",
+				list: [],
+			};
+		}
+		const filtered = filterQueryable(query.NOT, items, validMKeys, validSKeys);
+		if (filtered.error) {
+			if (filtered.error === "no filter" || filtered.error === "not filter") {
+				return {
+					error: "NOT must be a FILTER object",
+					list: [],
+				};
+			} else return filtered;
+		}
+		return {
+			error: "",
+			list: items.filter((item) => filtered.list.every((other) => !other.isSame(item))),
+		};
+	} else if (query.LT !== undefined && query.LT !== null) {
+		if (
+			typeof query.LT !== "object" ||
+			Object.keys(query.LT).length !== 1 ||
+			typeof Object.values(query.LT)[0] !== "number"
+		) {
+			return {
+				error: "LT must be an object with one mfield of type number",
+				list: [],
+			};
+		}
+		const mkey = Object.keys(query.LT)[0];
+		const output = {
+			error: "",
+			list: [] as Queryable[],
+		};
+		if (!MKEY.includes(mkey)) output.error = "LT must be an object with one mfield of type number";
+		else if (!validMKeys.includes(mkey))
+			output.error = "Cannot mix course_offerings and facilities fields in one query";
+		else output.list = items.filter((item) => item.getValue(mkey) < query.LT[mkey]);
+		return output;
+	} else if (query.GT !== undefined && query.GT !== null) {
+		if (
+			typeof query.GT !== "object" ||
+			Object.keys(query.GT).length !== 1 ||
+			typeof Object.values(query.GT)[0] !== "number"
+		) {
+			return {
+				error: "GT must be an object with one mfield of type number",
+				list: [],
+			};
+		}
+		const mkey = Object.keys(query.GT)[0];
+		const output = {
+			error: "",
+			list: [] as Queryable[],
+		};
+		if (!MKEY.includes(mkey)) output.error = "GT must be an object with one mfield of type number";
+		else if (!validMKeys.includes(mkey))
+			output.error = "Cannot mix course_offerings and facilities fields in one query";
+		else output.list = items.filter((item) => item.getValue(mkey) > query.GT[mkey]);
+		return output;
+	} else if (query.EQ !== undefined && query.EQ !== null) {
+		if (
+			typeof query.EQ !== "object" ||
+			Object.keys(query.EQ).length !== 1 ||
+			typeof Object.values(query.EQ)[0] !== "number"
+		) {
+			return {
+				error: "EQ must be an object with one mfield of type number",
+				list: [],
+			};
+		}
+		const mkey = Object.keys(query.EQ)[0];
+		const output = {
+			error: "",
+			list: [] as Queryable[],
+		};
+		if (!MKEY.includes(mkey)) output.error = "EQ must be an object with one mfield of type number";
+		else if (!validMKeys.includes(mkey))
+			output.error = "Cannot mix course_offerings and facilities fields in one query";
+		else output.list = items.filter((item) => item.getValue(mkey) === query.EQ[mkey]);
+		return output;
+	} else if (query.IS !== undefined && query.IS !== null) {
+		if (
+			typeof query.IS !== "object" ||
+			Object.keys(query.IS).length !== 1 ||
+			typeof Object.values(query.IS)[0] !== "string"
+		) {
+			return {
+				error: "IS must be an object with one sfield of type string",
+				list: [],
+			};
+		}
+		const skey = Object.keys(query.IS)[0];
+		let str: string = String(Object.values(query.IS)[0]);
+		let suffix = true; // str has to be at the end
+		let prefix = true; // str has to be at the beginning
+		if (str.slice(-1) === "*") {
+			suffix = false;
+			str = str.slice(0, -1);
+		}
+		if (str.charAt(0) === "*") {
+			prefix = false;
+			str = str.slice(1);
+		}
+		if (str.includes("*")) {
+			return {
+				error: "IS asterisks can only be first or last character",
+				list: [],
+			};
+		}
+		const output = {
+			error: "",
+			list: [] as Queryable[],
+		};
+		if (!SKEY.includes(skey)) output.error = "IS must be an object with one sfield of type string";
+		else if (!validSKeys.includes(skey))
+			output.error = "Cannot mix course_offerings and facilities fields in one query";
+		else output.list = items.filter((item) => includeString(item.getValue(skey), str, prefix, suffix));
+		return output;
+	} else if (query.IN !== undefined && query.IN !== null) {
+		const inValues = Object.values(query.IN);
+		const sValues = inValues[0];
+		if (
+			typeof query.IN !== "object" ||
+			Object.keys(query.IN).length !== 1 ||
+			!Array.isArray(sValues) ||
+			sValues.length < 1 ||
+			sValues.some((item) => typeof item !== "string")
+		) {
+			return {
+				error: "IN must be an object with one sfield and a non-empty array of strings",
+				list: [],
+			};
+		}
+		const skey = Object.keys(query.IN)[0];
+		const output = {
+			error: "",
+			list: [] as Queryable[],
+		};
+		if (!SKEY.includes(skey)) output.error = "IN must be an object with one sfield and a non-empty array of strings";
+		else if (!validSKeys.includes(skey))
+			output.error = "Cannot mix course_offerings and facilities fields in one query";
+		for (const sValue of sValues) {
+			output.list = items.filter((item) => (sValues as string[]).includes(item.getValue(skey)));
+		}
+		return output;
+	} else if (Object.keys(query).length > 0) {
+		return {
+			error: "not filter",
+			list: [],
+		};
+	} else {
+		return {
+			error: "no filter",
+			list: items,
+		};
+	}
+}
+
+function includeString(str1: string | undefined, str2: string, prefix: boolean, suffix: boolean): boolean {
+	if (str1 === undefined) return false;
+	let includes: boolean = str1.includes(str2);
+	if (prefix) includes = includes && str1.slice(0, str2.length) === str2;
+	if (suffix) includes = includes && str1.slice(-str2.length) === str2;
+	return includes;
+}
+
+function ordering(a: any, b: any, fields: string[]): number {
+	for (const field of fields) {
+		let diff = 0;
+		if (SKEY.includes(field)) diff = a[field].localeCompare(b[field]);
+		else diff = a[field] - b[field];
+		if (diff !== 0) return diff;
+	}
+	return 0;
+}
+
+function transformList(list: Queryable[], transformation: { GROUP: string[]; APPLY: any[] }): any[] {
+	const groups: any = {};
+	for (const group of list) {
+		const out = JSON.stringify(transformation.GROUP.map((g) => group.getValue(g)));
+		if (groups[out] === undefined) {
+			groups[out] = [];
+		}
+		groups[out].push(group);
+	}
+	const result: any[] = [];
+
+	for (const out in groups) {
+		const pile = groups[out];
+		const row: any = {};
+		for (const g of transformation.GROUP) {
+			row[g] = pile[0].getValue(g);
+		}
+		for (const rule of transformation.APPLY) {
+			const applykey = Object.keys(rule)[0];
+			const token = Object.keys(rule[applykey])[0];
+			const field = rule[applykey][token];
+			const values = pile.map((g: any) => g.getValue(field));
+			if (token === "MAX") {
+				row[applykey] = Math.max(...values);
+			} else if (token === "MIN") {
+				row[applykey] = Math.min(...values);
+			} else if (token === "COUNT") {
+				row[applykey] = new Set(values).size;
+			} else {
+				let total = new Decimal(0);
+				for (const v of values) {
+					total = total.add(new Decimal(v));
+				}
+				if (token === "SUM") {
+					row[applykey] = Number(total.toFixed(2));
+				} else {
+					row[applykey] = Number((total.toNumber() / values.length).toFixed(2));
+				}
+			}
+		}
+		result.push(row);
+	}
+
+	return result;
+}
+
+async function validateDatasetParams(
+	body: any,
+	file: any
+): Promise<{ valid: boolean; fields: any; zip: JSZip; is_valid_zip: Boolean }> {
+	let valid = true;
+	let zip: JSZip = JSZip();
+	const error: any = {};
+	let isValidZip: Boolean = true;
+
+	if (body.kind === undefined) {
+		error.kind = "required but missing";
+		valid = false;
+	} else if (typeof body.kind !== "string" || body.kind !== "course_offerings") {
+		error.kind = "expected to be course_offerings";
+		valid = false;
+	}
+	if (file === undefined) {
+		if (body.archive === undefined) {
+			error.archive = "required but missing";
+			valid = false;
+		} else {
+			error.archive = "expected non-empty file";
+			valid = false;
+		}
+	} else {
+		try {
+			zip = await JSZip.loadAsync(file.buffer);
+			if (!Object.values(zip.files).length) {
+				error.archive = "expected non-empty file";
+				valid = false;
+			}
+		} catch {
+			isValidZip = false;
+		}
+	}
+	return {
+		valid: valid,
+		fields: error,
+		zip: zip,
+		is_valid_zip: isValidZip,
+	};
+}
+
+async function validateNewDatasetParams(
+	body: any,
+	file: any
+): Promise<{ valid: boolean; file_type: String; fields: any; zip: JSZip; is_valid_zip: Boolean }> {
+	let valid = true;
+	let zip: JSZip = JSZip();
+	const error: any = {};
+	let isValidZip: Boolean = true;
+	let fileType: String = "error";
+
+	if (body.kind === undefined) {
+		error.kind = "required but missing";
+		valid = false;
+	} else if (typeof body.kind !== "string" || !(body.kind === "course_offerings" || body.kind === "facilities")) {
+		error.kind = "expected to be course_offerings or facilities";
+		valid = false;
+	}
+
+	fileType = body.kind;
+
+	if (file === undefined) {
+		if (body.archive === undefined) {
+			error.archive = "required but missing";
+			valid = false;
+		} else {
+			error.archive = "expected non-empty file";
+			valid = false;
+		}
+	} else if (!file.buffer || file.buffer.length === 0) {
+		error.archive = "expected non-empty file";
+		valid = false;
+	} else {
+		try {
+			zip = await JSZip.loadAsync(file.buffer);
+			if (!Object.values(zip.files).length) {
+				error.archive = "expected non-empty file";
+				valid = false;
+			}
+		} catch {
+			isValidZip = false;
+		}
+	}
+	return {
+		valid: valid,
+		file_type: fileType,
+		fields: error,
+		zip: zip,
+		is_valid_zip: isValidZip,
+	};
+}
+
+function validateSearchParamsV1(body: any): { valid: boolean; fields: any } {
+	let valid = true;
+	const error: any = {};
+	if (body === undefined || body.kind === undefined) {
+		error.kind = "required but missing";
+		valid = false;
+	} else if (typeof body.kind !== "string" || body.kind !== "course_offerings") {
+		error.kind = "expected to be course_offerings";
+		valid = false;
+	}
+	if (body === undefined || body.query === undefined) {
+		error.query = "required but missing";
+		valid = false;
+	} else if (typeof body.query !== "object") {
+		error.query = "expected an object";
+		valid = false;
+	}
+	return {
+		valid: valid,
+		fields: error,
+	};
+}
+
+function validateSearchParamsV2(body: any): { valid: boolean; fields: any } {
+	let valid = true;
+	const error: any = {};
+	if (body === undefined || body.kind === undefined) {
+		error.kind = "required but missing";
+		valid = false;
+	} else if (typeof body.kind !== "string" || !["course_offerings", "facilities"].includes(body.kind)) {
+		error.kind = "expected to be course_offerings or facilities";
+		valid = false;
+	}
+	if (body === undefined || body.query === undefined) {
+		error.query = "required but missing";
+		valid = false;
+	} else if (typeof body.query !== "object" || body.query === null) {
+		error.query = "expected an object";
+		valid = false;
+	}
+	return {
+		valid: valid,
+		fields: error,
+	};
+}
+
+function errorBadRequest(error_message: string): ApiOutput {
+	return {
+		status: 400,
+		body: {
+			error: "Invalid query",
+			message: error_message,
+		},
+	};
+}
