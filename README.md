@@ -1,9 +1,8 @@
-# CPSC 310 Project Repository
+# Insight UBC Project Repository
 
-This repository contains the configuration for your team's project; copy in `src/`, `test/`, and `openapi.yml` from the D2 repository your team adopted (see D3, Part 1).
-Please keep your repository private.
+This repository contains the files for my UBC CPSC 310 Insight UBC project. 
 
-For information about the project, grading, and the deliverable, see the course webpage.
+The README description detailed below is from the UBC CPSC 310 Base Directory.
 
 ## Configuring your environment
 
